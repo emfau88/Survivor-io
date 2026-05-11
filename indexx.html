@@ -1,0 +1,1411 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <title>Iso Survivors</title>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.70.0/dist/phaser.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            background: #0d0d1a; 
+            overflow: hidden; 
+            touch-action: none; 
+            width: 100vw; 
+            height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #game-container { 
+            width: 100vw; 
+            height: 100vh; 
+            position: relative;
+        }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <div id="game-container"></div>
+    <script>
+    // ============================================================
+    // KONSTANTEN
+    // ============================================================
+    const TILE_W = 64;
+    const TILE_H = 32;
+    const MAP_SIZE = 24;
+    const POOL_ENEMIES = 150;
+    const POOL_PROJECTILES = 80;
+    const POOL_XP = 200;
+    const POOL_PARTICLES = 100;
+    
+    const COLORS = {
+        grass: 0x2d5a3d,
+        grassLight: 0x3d7a4d,
+        stone: 0x6b6b7b,
+        stoneLight: 0x7b7b8b,
+        wall: 0x4a4a5a,
+        wallTop: 0x5a5a6a,
+        wallSide: 0x3a3a4a,
+        player: 0x3b82f6,
+        playerLight: 0x60a5fa,
+        enemyTank: 0xef4444,
+        enemyFast: 0xf59e0b,
+        enemyRange: 0xa855f7,
+        projectile: 0xffffff,
+        xp: 0xfacc15,
+        xpGlow: 0xfef08a,
+        boss: 0xdc2626,
+        health: 0x22c55e,
+        healthBg: 0x374151,
+        xpBar: 0x3b82f6,
+        xpBarBg: 0x1e3a5f,
+        uiText: 0xffffff,
+        shadow: 0x000000
+    };
+
+    // ============================================================
+    // ISOMETRIC MATH
+    // ============================================================
+    const IsoMath = {
+        toIso(mx, my) {
+            return {
+                x: (mx - my) * (TILE_W / 2),
+                y: (mx + my) * (TILE_H / 2)
+            };
+        },
+        toMap(sx, sy) {
+            return {
+                x: (sx / (TILE_W / 2) + sy / (TILE_H / 2)) / 2,
+                y: (sy / (TILE_H / 2) - sx / (TILE_W / 2)) / 2
+            };
+        },
+        distance(a, b) {
+            const dx = a.mx - b.mx;
+            const dy = a.my - b.my;
+            return Math.sqrt(dx * dx + dy * dy);
+        },
+        angle(a, b) {
+            return Math.atan2(b.my - a.my, b.mx - a.mx);
+        }
+    };
+
+    // ============================================================
+    // UPGRADE DATA
+    // ============================================================
+    const UPGRADES = [
+        { id: 'damage', name: 'Schaden +', desc: '+20% Schaden', icon: '⚔️', apply: (p) => { p.damageMult *= 1.2; } },
+        { id: 'speed', name: 'Tempo +', desc: '+15% Bewegung', icon: '👟', apply: (p) => { p.speedMult *= 1.15; } },
+        { id: 'area', name: 'Bereich +', desc: '+25% Reichweite', icon: '⭕', apply: (p) => { p.areaMult *= 1.25; } },
+        { id: 'cooldown', name: 'Cooldown -', desc: '-15% Cooldown', icon: '⚡', apply: (p) => { p.cooldownMult *= 0.85; } },
+        { id: 'multishot', name: 'Multi-Schuss', desc: '+1 Projektil', icon: '🔫', apply: (p) => { p.projectileCount += 1; } },
+        { id: 'lifesteal', name: 'Lebensraub', desc: '+5% Heilung pro Kill', icon: '❤️', apply: (p) => { p.lifesteal += 0.05; } },
+        { id: 'magnet', name: 'Magnet', desc: '+50% XP-Reichweite', icon: '🧲', apply: (p) => { p.magnetRange *= 1.5; } },
+        { id: 'hp', name: 'Leben +', desc: '+30 Max HP', icon: '🛡️', apply: (p) => { p.maxHp += 30; p.hp += 30; } }
+    ];
+
+    // ============================================================
+    // SPATIAL GRID
+    // ============================================================
+    class SpatialGrid {
+        constructor(cellSize) {
+            this.cellSize = cellSize;
+            this.cells = new Map();
+        }
+        
+        clear() {
+            this.cells.clear();
+        }
+        
+        insert(entity) {
+            const cx = Math.floor(entity.mx / this.cellSize);
+            const cy = Math.floor(entity.my / this.cellSize);
+            const key = `${cx},${cy}`;
+            if (!this.cells.has(key)) this.cells.set(key, []);
+            this.cells.get(key).push(entity);
+        }
+        
+        queryRange(mx, my, radius) {
+            const results = [];
+            const rCells = Math.ceil(radius / this.cellSize);
+            const cx = Math.floor(mx / this.cellSize);
+            const cy = Math.floor(my / this.cellSize);
+            
+            for (let dx = -rCells; dx <= rCells; dx++) {
+                for (let dy = -rCells; dy <= rCells; dy++) {
+                    const key = `${cx + dx},${cy + dy}`;
+                    const cell = this.cells.get(key);
+                    if (cell) {
+                        for (const e of cell) {
+                            if (IsoMath.distance({mx, my}, e) <= radius) {
+                                results.push(e);
+                            }
+                        }
+                    }
+                }
+            }
+            return results;
+        }
+    }
+
+    // ============================================================
+    // ISO TILEMAP
+    // ============================================================
+    class IsoTilemap {
+        constructor(scene) {
+            this.scene = scene;
+            this.tiles = [];
+            this.walls = [];
+            this.container = scene.add.container(0, 0);
+            this.generate();
+        }
+        
+        generate() {
+            const offsetX = this.scene.cameras.main.width / 2;
+            const offsetY = this.scene.cameras.main.height / 3;
+            
+            for (let x = 0; x < MAP_SIZE; x++) {
+                this.tiles[x] = [];
+                for (let y = 0; y < MAP_SIZE; y++) {
+                    const type = Math.random() < 0.15 ? 'wall' : (Math.random() < 0.3 ? 'stone' : 'grass');
+                    this.tiles[x][y] = type;
+                    
+                    const pos = IsoMath.toIso(x, y);
+                    const screenX = pos.x + offsetX;
+                    const screenY = pos.y + offsetY;
+                    
+                    // Boden
+                    const color = type === 'grass' 
+                        ? ((x + y) % 2 === 0 ? COLORS.grass : COLORS.grassLight)
+                        : ((x + y) % 2 === 0 ? COLORS.stone : COLORS.stoneLight);
+                    
+                    const tile = this.scene.add.polygon(screenX, screenY, [
+                        0, -TILE_H/2,
+                        TILE_W/2, 0,
+                        0, TILE_H/2,
+                        -TILE_W/2, 0
+                    ], color);
+                    tile.setStrokeStyle(1, 0x1a1a2e, 0.3);
+                    tile.setDepth(screenY);
+                    this.container.add(tile);
+                    
+                    // Wand
+                    if (type === 'wall') {
+                        const wallH = 24;
+                        const wallTop = this.scene.add.polygon(screenX, screenY - wallH, [
+                            0, -TILE_H/2 - wallH,
+                            TILE_W/2, -wallH,
+                            0, TILE_H/2 - wallH,
+                            -TILE_W/2, -wallH
+                        ], COLORS.wallTop);
+                        wallTop.setDepth(screenY - wallH + 1);
+                        this.container.add(wallTop);
+                        
+                        const wallLeft = this.scene.add.polygon(screenX - TILE_W/4, screenY + TILE_H/4 - wallH/2, [
+                            -TILE_W/2, -wallH,
+                            0, -TILE_H/2 - wallH,
+                            0, -TILE_H/2,
+                            -TILE_W/2, 0
+                        ], COLORS.wallSide);
+                        wallLeft.setDepth(screenY + 1);
+                        this.container.add(wallLeft);
+                        
+                        const wallRight = this.scene.add.polygon(screenX + TILE_W/4, screenY + TILE_H/4 - wallH/2, [
+                            0, -TILE_H/2 - wallH,
+                            TILE_W/2, -wallH,
+                            TILE_W/2, 0,
+                            0, -TILE_H/2
+                        ], COLORS.wall);
+                        wallRight.setDepth(screenY + 1);
+                        this.container.add(wallRight);
+                        
+                        this.walls.push({ mx: x, my: y, screenX, screenY });
+                    }
+                }
+            }
+        }
+        
+        isWall(mx, my) {
+            const ix = Math.floor(mx);
+            const iy = Math.floor(my);
+            if (ix < 0 || ix >= MAP_SIZE || iy < 0 || iy >= MAP_SIZE) return true;
+            return this.tiles[ix][iy] === 'wall';
+        }
+        
+        getValidSpawn() {
+            let attempts = 0;
+            while (attempts < 100) {
+                const x = Math.floor(Math.random() * MAP_SIZE);
+                const y = Math.floor(Math.random() * MAP_SIZE);
+                if (this.tiles[x][y] !== 'wall') {
+                    return { mx: x + 0.5, my: y + 0.5 };
+                }
+                attempts++;
+            }
+            return { mx: 5, my: 5 };
+        }
+    }
+
+    // ============================================================
+    // ENTITY POOL MANAGER
+    // ============================================================
+    class EntityPool {
+        constructor(scene, maxSize, createFn) {
+            this.scene = scene;
+            this.maxSize = maxSize;
+            this.createFn = createFn;
+            this.pool = [];
+            this.active = [];
+            
+            for (let i = 0; i < maxSize; i++) {
+                const entity = createFn();
+                entity.setVisible(false);
+                entity.setActive(false);
+                this.pool.push(entity);
+            }
+        }
+        
+        spawn(...args) {
+            const entity = this.pool.find(e => !e.active);
+            if (!entity) return null;
+            entity.setActive(true);
+            entity.setVisible(true);
+            entity.reset(...args);
+            this.active.push(entity);
+            return entity;
+        }
+        
+        despawn(entity) {
+            entity.setActive(false);
+            entity.setVisible(false);
+            const idx = this.active.indexOf(entity);
+            if (idx > -1) this.active.splice(idx, 1);
+        }
+        
+        updateAll(dt, time) {
+            for (let i = this.active.length - 1; i >= 0; i--) {
+                const entity = this.active[i];
+                if (!entity.update(dt, time)) {
+                    this.despawn(entity);
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // PLAYER
+    // ============================================================
+    class Player extends Phaser.GameObjects.Container {
+        constructor(scene, mx, my) {
+            const pos = IsoMath.toIso(mx, my);
+            const screenX = pos.x + scene.cameras.main.width / 2;
+            const screenY = pos.y + scene.cameras.main.height / 3;
+            
+            super(scene, screenX, screenY);
+            scene.add.existing(this);
+            
+            this.mx = mx;
+            this.my = my;
+            this.baseSpeed = 3.5;
+            this.speedMult = 1;
+            this.damageMult = 1;
+            this.areaMult = 1;
+            this.cooldownMult = 1;
+            this.projectileCount = 1;
+            this.lifesteal = 0;
+            this.magnetRange = 3;
+            this.maxHp = 100;
+            this.hp = 100;
+            this.xp = 0;
+            this.xpToLevel = 50;
+            this.level = 1;
+            this.kills = 0;
+            this.alive = true;
+            
+            // Shadow
+            this.shadow = scene.add.ellipse(0, 8, 28, 12, COLORS.shadow, 0.4);
+            this.add(this.shadow);
+            
+            // Body (diamond)
+            this.body = scene.add.polygon(0, -4, [
+                0, -16,
+                14, -4,
+                0, 8,
+                -14, -4
+            ], COLORS.player);
+            this.add(this.body);
+            
+            // Highlight
+            this.highlight = scene.add.polygon(0, -6, [
+                0, -12,
+                8, -4,
+                0, 4,
+                -8, -4
+            ], COLORS.playerLight);
+            this.add(this.highlight);
+            
+            // Weapon indicator
+            this.weapon = scene.add.rectangle(12, -8, 4, 12, 0xffffff);
+            this.weapon.setOrigin(0.5, 1);
+            this.add(this.weapon);
+            
+            this.setDepth(screenY + 100);
+            this.setSize(20, 20);
+        }
+        
+        update(dt, input, tilemap) {
+            if (!this.alive) return;
+            
+            // Movement
+            let dx = 0, dy = 0;
+            if (input.keys.w || input.keys.up) dy -= 1;
+            if (input.keys.s || input.keys.down) dy += 1;
+            if (input.keys.a || input.keys.left) dx -= 1;
+            if (input.keys.d || input.keys.right) dx += 1;
+            
+            // Joystick
+            if (input.joystick.active) {
+                dx = input.joystick.x;
+                dy = input.joystick.y;
+            }
+            
+            // Normalize
+            if (dx !== 0 || dy !== 0) {
+                const len = Math.sqrt(dx*dx + dy*dy);
+                if (len > 1) { dx /= len; dy /= len; }
+                
+                const speed = this.baseSpeed * this.speedMult * dt * 0.06;
+                const newMx = this.mx + dx * speed;
+                const newMy = this.my + dy * speed;
+                
+                if (!tilemap.isWall(newMx, this.my)) this.mx = newMx;
+                if (!tilemap.isWall(this.mx, newMy)) this.my = newMy;
+                
+                // Rotate weapon
+                const angle = Math.atan2(dy, dx);
+                this.weapon.setRotation(angle + Math.PI/2);
+            }
+            
+            // Update screen position
+            const pos = IsoMath.toIso(this.mx, this.my);
+            const centerX = this.scene.cameras.main.width / 2;
+            const centerY = this.scene.cameras.main.height / 3;
+            this.x = pos.x + centerX;
+            this.y = pos.y + centerY;
+            this.setDepth(this.y + 100);
+        }
+        
+        takeDamage(amount) {
+            this.hp -= amount;
+            if (this.hp <= 0) {
+                this.hp = 0;
+                this.alive = false;
+            }
+            // Flash red
+            this.body.setFillStyle(0xff0000);
+            this.scene.time.delayedCall(100, () => {
+                this.body.setFillStyle(COLORS.player);
+            });
+        }
+        
+        heal(amount) {
+            this.hp = Math.min(this.hp + amount, this.maxHp);
+        }
+        
+        addXp(amount) {
+            this.xp += amount;
+            if (this.xp >= this.xpToLevel) {
+                this.xp -= this.xpToLevel;
+                this.level++;
+                this.xpToLevel = Math.floor(this.xpToLevel * 1.3);
+                return true; // Leveled up
+            }
+            return false;
+        }
+    }
+
+    // ============================================================
+    // ENEMY
+    // ============================================================
+    class Enemy extends Phaser.GameObjects.Container {
+        constructor(scene) {
+            super(scene, 0, 0);
+            scene.add.existing(this);
+            
+            this.mx = 0;
+            this.my = 0;
+            this.hp = 10;
+            this.maxHp = 10;
+            this.speed = 1.5;
+            this.damage = 5;
+            this.xpValue = 5;
+            this.type = 'tank';
+            this.alive = true;
+            this.pushX = 0;
+            this.pushY = 0;
+            
+            // Shadow
+            this.shadow = scene.add.ellipse(0, 8, 24, 10, COLORS.shadow, 0.4);
+            this.add(this.shadow);
+            
+            // Body
+            this.body = scene.add.polygon(0, -2, [
+                0, -14,
+                12, -2,
+                0, 6,
+                -12, -2
+            ], COLORS.enemyTank);
+            this.add(this.body);
+            
+            // Eyes
+            this.eyeL = scene.add.circle(-4, -6, 2, 0xffffff);
+            this.eyeR = scene.add.circle(4, -6, 2, 0xffffff);
+            this.pupilL = scene.add.circle(-4, -6, 1, 0x000000);
+            this.pupilR = scene.add.circle(4, -6, 1, 0x000000);
+            this.add([this.eyeL, this.eyeR, this.pupilL, this.pupilR]);
+            
+            // HP bar bg
+            this.hpBg = scene.add.rectangle(0, -20, 20, 3, COLORS.healthBg);
+            this.add(this.hpBg);
+            
+            // HP bar
+            this.hpBar = scene.add.rectangle(0, -20, 20, 3, COLORS.health);
+            this.hpBar.setOrigin(0, 0.5);
+            this.hpBar.x = -10;
+            this.add(this.hpBar);
+            
+            this.setVisible(false);
+            this.setActive(false);
+        }
+        
+        reset(type, mx, my, waveMult) {
+            this.mx = mx;
+            this.my = my;
+            this.type = type;
+            this.alive = true;
+            this.pushX = 0;
+            this.pushY = 0;
+            
+            const centerX = this.scene.cameras.main.width / 2;
+            const centerY = this.scene.cameras.main.height / 3;
+            const pos = IsoMath.toIso(mx, my);
+            this.x = pos.x + centerX;
+            this.y = pos.y + centerY;
+            
+            // Configure by type
+            switch(type) {
+                case 'tank':
+                    this.maxHp = Math.floor(25 * waveMult);
+                    this.hp = this.maxHp;
+                    this.speed = 1.2;
+                    this.damage = 8;
+                    this.xpValue = 8;
+                    this.body.setFillStyle(COLORS.enemyTank);
+                    this.setScale(1.2);
+                    break;
+                case 'fast':
+                    this.maxHp = Math.floor(8 * waveMult);
+                    this.hp = this.maxHp;
+                    this.speed = 2.8;
+                    this.damage = 4;
+                    this.xpValue = 5;
+                    this.body.setFillStyle(COLORS.enemyFast);
+                    this.setScale(0.9);
+                    break;
+                case 'range':
+                    this.maxHp = Math.floor(12 * waveMult);
+                    this.hp = this.maxHp;
+                    this.speed = 1.8;
+                    this.damage = 6;
+                    this.xpValue = 10;
+                    this.body.setFillStyle(COLORS.enemyRange);
+                    this.setScale(1.0);
+                    break;
+                case 'boss':
+                    this.maxHp = Math.floor(200 * waveMult);
+                    this.hp = this.maxHp;
+                    this.speed = 0.8;
+                    this.damage = 20;
+                    this.xpValue = 100;
+                    this.body.setFillStyle(COLORS.boss);
+                    this.setScale(2.0);
+                    break;
+            }
+            
+            this.updateHpBar();
+            this.setDepth(this.y);
+            this.setVisible(true);
+            this.setActive(true);
+        }
+        
+        update(dt, player, tilemap, time) {
+            if (!this.alive) return false;
+            
+            // Move toward player
+            const angle = IsoMath.angle(this, player);
+            const dist = IsoMath.distance(this, player);
+            
+            if (dist > 0.5) {
+                const moveSpeed = this.speed * dt * 0.06;
+                let dx = Math.cos(angle) * moveSpeed;
+                let dy = Math.sin(angle) * moveSpeed;
+                
+                // Separation from other enemies
+                // (simplified - full separation would need grid query)
+                
+                // Apply push
+                dx += this.pushX;
+                dy += this.pushY;
+                this.pushX *= 0.9;
+                this.pushY *= 0.9;
+                
+                const newMx = this.mx + dx;
+                const newMy = this.my + dy;
+                
+                if (!tilemap.isWall(newMx, this.my)) this.mx = newMx;
+                if (!tilemap.isWall(this.mx, newMy)) this.my = newMy;
+            }
+            
+            // Update screen position
+            const pos = IsoMath.toIso(this.mx, this.my);
+            const centerX = this.scene.cameras.main.width / 2;
+            const centerY = this.scene.cameras.main.height / 3;
+            this.x = pos.x + centerX;
+            this.y = pos.y + centerY;
+            this.setDepth(this.y);
+            
+            // Look at player
+            const lookAngle = Math.atan2(player.my - this.my, player.mx - this.mx);
+            this.pupilL.x = -4 + Math.cos(lookAngle) * 1;
+            this.pupilL.y = -6 + Math.sin(lookAngle) * 1;
+            this.pupilR.x = 4 + Math.cos(lookAngle) * 1;
+            this.pupilR.y = -6 + Math.sin(lookAngle) * 1;
+            
+            return true;
+        }
+        
+        takeDamage(amount, pushAngle, pushForce) {
+            this.hp -= amount;
+            this.pushX += Math.cos(pushAngle) * pushForce;
+            this.pushY += Math.sin(pushAngle) * pushForce;
+            this.updateHpBar();
+            
+            // Flash
+            this.body.setFillStyle(0xffffff);
+            this.scene.time.delayedCall(80, () => {
+                if (this.active) {
+                    const colors = {
+                        tank: COLORS.enemyTank,
+                        fast: COLORS.enemyFast,
+                        range: COLORS.enemyRange,
+                        boss: COLORS.boss
+                    };
+                    this.body.setFillStyle(colors[this.type] || COLORS.enemyTank);
+                }
+            });
+            
+            if (this.hp <= 0) {
+                this.alive = false;
+                return true; // died
+            }
+            return false;
+        }
+        
+        updateHpBar() {
+            const pct = Math.max(0, this.hp / this.maxHp);
+            this.hpBar.setScale(pct, 1);
+            this.hpBar.setVisible(pct < 1 && pct > 0);
+            this.hpBg.setVisible(pct < 1 && pct > 0);
+        }
+    }
+
+    // ============================================================
+    // PROJECTILE
+    // ============================================================
+    class Projectile extends Phaser.GameObjects.Container {
+        constructor(scene) {
+            super(scene, 0, 0);
+            scene.add.existing(this);
+            
+            this.mx = 0;
+            this.my = 0;
+            this.vx = 0;
+            this.vy = 0;
+            this.speed = 8;
+            this.damage = 10;
+            this.life = 2;
+            this.pierce = 0;
+            this.hitEnemies = new Set();
+            
+            // Trail
+            this.trail = [];
+            for (let i = 0; i < 3; i++) {
+                const t = scene.add.circle(0, 0, 3 - i, COLORS.projectile, 0.7 - i * 0.2);
+                this.add(t);
+                this.trail.push(t);
+            }
+            
+            // Core
+            this.core = scene.add.circle(0, 0, 4, 0xffffff);
+            this.add(this.core);
+            
+            // Glow
+            this.glow = scene.add.circle(0, 0, 8, COLORS.projectile, 0.2);
+            this.add(this.glow);
+            
+            this.setVisible(false);
+            this.setActive(false);
+        }
+        
+        reset(mx, my, angle, damage, speed, pierce = 0) {
+            this.mx = mx;
+            this.my = my;
+            this.vx = Math.cos(angle) * speed;
+            this.vy = Math.sin(angle) * speed;
+            this.damage = damage;
+            this.life = 2.5;
+            this.pierce = pierce;
+            this.hitEnemies.clear();
+            this.speed = speed;
+            
+            const centerX = this.scene.cameras.main.width / 2;
+            const centerY = this.scene.cameras.main.height / 3;
+            const pos = IsoMath.toIso(mx, my);
+            this.x = pos.x + centerX;
+            this.y = pos.y + centerY;
+            this.setDepth(this.y + 50);
+            
+            this.setVisible(true);
+            this.setActive(true);
+        }
+        
+        update(dt, tilemap) {
+            if (!this.active) return false;
+            
+            this.life -= dt * 0.001;
+            if (this.life <= 0) return false;
+            
+            const move = this.speed * dt * 0.06;
+            this.mx += this.vx * move;
+            this.my += this.vy * move;
+            
+            // Wall collision
+            if (tilemap.isWall(this.mx, this.my)) return false;
+            
+            // Update visual
+            const pos = IsoMath.toIso(this.mx, this.my);
+            const centerX = this.scene.cameras.main.width / 2;
+            const centerY = this.scene.cameras.main.height / 3;
+            
+            // Trail effect
+            for (let i = this.trail.length - 1; i >= 0; i--) {
+                if (i === 0) {
+                    this.trail[i].x = this.x - (pos.x + centerX);
+                    this.trail[i].y = this.y - (pos.y + centerY);
+                } else {
+                    this.trail[i].x = this.trail[i-1].x * 0.7;
+                    this.trail[i].y = this.trail[i-1].y * 0.7;
+                }
+            }
+            
+            this.x = pos.x + centerX;
+            this.y = pos.y + centerY;
+            this.setDepth(this.y + 50);
+            
+            return true;
+        }
+    }
+
+    // ============================================================
+    // XP ORB
+    // ============================================================
+    class XPOrb extends Phaser.GameObjects.Container {
+        constructor(scene) {
+            super(scene, 0, 0);
+            scene.add.existing(this);
+            
+            this.mx = 0;
+            this.my = 0;
+            this.value = 5;
+            this.magnet = false;
+            this.life = 30;
+            
+            // Glow
+            this.glow = scene.add.circle(0, 0, 10, COLORS.xpGlow, 0.3);
+            this.add(this.glow);
+            
+            // Core
+            this.core = scene.add.circle(0, 0, 5, COLORS.xp);
+            this.add(this.core);
+            
+            // Sparkle
+            this.sparkle = scene.add.star(0, 0, 4, 3, 6, 0xffffff, 0.8);
+            this.add(this.sparkle);
+            
+            this.setVisible(false);
+            this.setActive(false);
+        }
+        
+        reset(mx, my, value) {
+            this.mx = mx;
+            this.my = my;
+            this.value = value;
+            this.magnet = false;
+            this.life = 30;
+            
+            const centerX = this.scene.cameras.main.width / 2;
+            const centerY = this.scene.cameras.main.height / 3;
+            const pos = IsoMath.toIso(mx, my);
+            this.x = pos.x + centerX;
+            this.y = pos.y + centerY;
+            this.setDepth(this.y + 40);
+            
+            this.setVisible(true);
+            this.setActive(true);
+        }
+        
+        update(dt, player) {
+            if (!this.active) return false;
+            
+            this.life -= dt * 0.001;
+            if (this.life <= 0) return false;
+            
+            const dist = IsoMath.distance(this, player);
+            
+            // Magnet effect
+            if (dist < player.magnetRange) {
+                this.magnet = true;
+            }
+            
+            if (this.magnet) {
+                const angle = IsoMath.angle(this, player);
+                const speed = 6 * dt * 0.06;
+                this.mx += Math.cos(angle) * speed;
+                this.my += Math.sin(angle) * speed;
+            }
+            
+            // Collection
+            if (dist < 0.4) {
+                return 'collected';
+            }
+            
+            // Update visual
+            const pos = IsoMath.toIso(this.mx, this.my);
+            const centerX = this.scene.cameras.main.width / 2;
+            const centerY = this.scene.cameras.main.height / 3;
+            this.x = pos.x + centerX;
+            this.y = pos.y + centerY;
+            this.setDepth(this.y + 40);
+            
+            // Animation
+            this.sparkle.setRotation(this.sparkle.rotation + dt * 0.005);
+            this.glow.setScale(1 + Math.sin(Date.now() * 0.005) * 0.2);
+            
+            return true;
+        }
+    }
+
+    // ============================================================
+    // PARTICLE
+    // ============================================================
+    class Particle extends Phaser.GameObjects.Container {
+        constructor(scene) {
+            super(scene, 0, 0);
+            scene.add.existing(this);
+            
+            this.life = 0;
+            this.vx = 0;
+            this.vy = 0;
+            
+            this.sprite = scene.add.circle(0, 0, 3, 0xffffff);
+            this.add(this.sprite);
+            
+            this.setVisible(false);
+            this.setActive(false);
+        }
+        
+        reset(x, y, color, speed, life) {
+            this.x = x;
+            this.y = y;
+            this.life = life;
+            this.vx = (Math.random() - 0.5) * speed;
+            this.vy = (Math.random() - 0.5) * speed - 2;
+            this.sprite.setFillStyle(color);
+            this.sprite.setAlpha(1);
+            this.setDepth(this.y + 60);
+            this.setVisible(true);
+            this.setActive(true);
+        }
+        
+        update(dt) {
+            if (!this.active) return false;
+            
+            this.life -= dt * 0.001;
+            if (this.life <= 0) return false;
+            
+            this.x += this.vx * dt * 0.06;
+            this.y += this.vy * dt * 0.06;
+            this.vy += 0.1; // gravity
+            
+            this.sprite.setAlpha(this.life);
+            this.setDepth(this.y + 60);
+            
+            return true;
+        }
+    }
+
+    // ============================================================
+    // INPUT MANAGER (Joystick)
+    // ============================================================
+    class InputManager {
+        constructor(scene) {
+            this.scene = scene;
+            this.keys = { w: false, a: false, s: false, d: false, up: false, down: false, left: false, right: false };
+            this.joystick = { active: false, x: 0, y: 0, originX: 0, originY: 0, currentX: 0, currentY: 0 };
+            this.pointer = { x: 0, y: 0, isDown: false };
+            
+            // Keyboard
+            scene.input.keyboard.on('keydown', (e) => {
+                const key = e.key.toLowerCase();
+                if (this.keys.hasOwnProperty(key)) this.keys[key] = true;
+            });
+            scene.input.keyboard.on('keyup', (e) => {
+                const key = e.key.toLowerCase();
+                if (this.keys.hasOwnProperty(key)) this.keys[key] = false;
+            });
+            
+            // Touch / Mouse for joystick
+            scene.input.on('pointerdown', (p) => {
+                this.pointer.isDown = true;
+                this.pointer.x = p.x;
+                this.pointer.y = p.y;
+                
+                // Left half = joystick
+                if (p.x < scene.cameras.main.width / 2) {
+                    this.joystick.active = true;
+                    this.joystick.originX = p.x;
+                    this.joystick.originY = p.y;
+                    this.joystick.currentX = p.x;
+                    this.joystick.currentY = p.y;
+                }
+            });
+            
+            scene.input.on('pointermove', (p) => {
+                this.pointer.x = p.x;
+                this.pointer.y = p.y;
+                
+                if (this.joystick.active) {
+                    this.joystick.currentX = p.x;
+                    this.joystick.currentY = p.y;
+                    const dx = p.x - this.joystick.originX;
+                    const dy = p.y - this.joystick.originY;
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    const maxDist = 60;
+                    
+                    if (dist > maxDist) {
+                        const scale = maxDist / dist;
+                        this.joystick.x = dx * scale / maxDist;
+                        this.joystick.y = dy * scale / maxDist;
+                    } else {
+                        this.joystick.x = dx / maxDist;
+                        this.joystick.y = dy / maxDist;
+                    }
+                }
+            });
+            
+            scene.input.on('pointerup', () => {
+                this.pointer.isDown = false;
+                this.joystick.active = false;
+                this.joystick.x = 0;
+                this.joystick.y = 0;
+            });
+        }
+        
+        drawJoystick(graphics) {
+            if (!this.joystick.active) return;
+            
+            graphics.fillStyle(0xffffff, 0.15);
+            graphics.fillCircle(this.joystick.originX, this.joystick.originY, 50);
+            graphics.lineStyle(2, 0xffffff, 0.3);
+            graphics.strokeCircle(this.joystick.originX, this.joystick.originY, 50);
+            
+            graphics.fillStyle(0xffffff, 0.4);
+            graphics.fillCircle(
+                this.joystick.originX + this.joystick.x * 50,
+                this.joystick.originY + this.joystick.y * 50,
+                20
+            );
+        }
+    }
+
+    // ============================================================
+    // WAVE MANAGER
+    // ============================================================
+    class WaveManager {
+        constructor(scene) {
+            this.scene = scene;
+            this.time = 0;
+            this.wave = 1;
+            this.spawnTimer = 0;
+            this.bossSpawned = false;
+            this.difficulty = 1;
+        }
+        
+        update(dt, enemyPool, player, tilemap) {
+            this.time += dt * 0.001;
+            this.difficulty = 1 + this.time * 0.02;
+            this.wave = Math.floor(this.time / 30) + 1;
+            
+            this.spawnTimer -= dt;
+            if (this.spawnTimer <= 0) {
+                this.spawnTimer = Math.max(200, 1500 - this.time * 10);
+                this.spawnEnemies(enemyPool, player, tilemap);
+            }
+            
+            // Boss at 60s
+            if (this.time > 60 && !this.bossSpawned) {
+                this.bossSpawned = true;
+                this.spawnBoss(enemyPool, player, tilemap);
+            }
+        }
+        
+        spawnEnemies(enemyPool, player, tilemap) {
+            const count = Math.min(3 + Math.floor(this.time / 15), 8);
+            
+            for (let i = 0; i < count; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 12 + Math.random() * 6;
+                const mx = player.mx + Math.cos(angle) * dist;
+                const my = player.my + Math.sin(angle) * dist;
+                
+                if (mx > 1 && mx < MAP_SIZE - 1 && my > 1 && my < MAP_SIZE - 1 && !tilemap.isWall(mx, my)) {
+                    const roll = Math.random();
+                    let type = 'tank';
+                    if (roll > 0.6) type = 'fast';
+                    else if (roll > 0.85) type = 'range';
+                    
+                    enemyPool.spawn(type, mx, my, this.difficulty);
+                }
+            }
+        }
+        
+        spawnBoss(enemyPool, player, tilemap) {
+            const angle = Math.random() * Math.PI * 2;
+            const mx = player.mx + Math.cos(angle) * 10;
+            const my = player.my + Math.sin(angle) * 10;
+            
+            if (!tilemap.isWall(mx, my)) {
+                enemyPool.spawn('boss', mx, my, this.difficulty);
+            }
+        }
+    }
+
+    // ============================================================
+    // UPGRADE UI
+    // ============================================================
+    class UpgradeUI extends Phaser.GameObjects.Container {
+        constructor(scene) {
+            super(scene, 0, 0);
+            scene.add.existing(this);
+            
+            this.visible = false;
+            this.cards = [];
+            this.selected = false;
+            
+            const w = scene.cameras.main.width;
+            const h = scene.cameras.main.height;
+            
+            // Background
+            this.bg = scene.add.rectangle(w/2, h/2, w, h, 0x000000, 0.7);
+            this.add(this.bg);
+            this.bg.setInteractive();
+            
+            // Title
+            this.title = scene.add.text(w/2, h/2 - 180, 'LEVEL AUFSTIEG!', {
+                fontSize: '36px',
+                fontStyle: 'bold',
+                color: '#facc15'
+            }).setOrigin(0.5);
+            this.add(this.title);
+            
+            // Cards
+            for (let i = 0; i < 3; i++) {
+                const card = this.createCard(i, w, h);
+                this.cards.push(card);
+                this.add(card.container);
+            }
+            
+            this.setDepth(10000);
+        }
+        
+        createCard(index, w, h) {
+            const x = w/2 + (index - 1) * 160;
+            const y = h/2;
+            const container = this.scene.add.container(x, y);
+            
+            const bg = this.scene.add.rectangle(0, 0, 140, 180, 0x1e293b, 0.95);
+            bg.setStrokeStyle(2, 0x3b82f6, 0.5);
+            container.add(bg);
+            
+            const icon = this.scene.add.text(0, -50, '⚔️', { fontSize: '40px' }).setOrigin(0.5);
+            container.add(icon);
+            
+            const name = this.scene.add.text(0, -10, 'Name', { fontSize: '16px', fontStyle: 'bold', color: '#fff' }).setOrigin(0.5);
+            container.add(name);
+            
+            const desc = this.scene.add.text(0, 25, 'Beschreibung', { fontSize: '12px', color: '#aaa', align: 'center', wordWrap: { width: 120 } }).setOrigin(0.5);
+            container.add(desc);
+            
+            bg.setInteractive();
+            bg.on('pointerover', () => {
+                bg.setFillStyle(0x334155);
+                container.setScale(1.05);
+            });
+            bg.on('pointerout', () => {
+                bg.setFillStyle(0x1e293b);
+                container.setScale(1);
+            });
+            bg.on('pointerdown', () => {
+                this.select(index);
+            });
+            
+            return { container, bg, icon, name, desc, upgrade: null };
+        }
+        
+        show(player) {
+            this.visible = true;
+            this.selected = false;
+            this.setVisible(true);
+            
+            // Pick 3 random upgrades
+            const available = UPGRADES.filter(u => true); // Could filter by max level
+            const shuffled = available.sort(() => Math.random() - 0.5);
+            
+            for (let i = 0; i < 3; i++) {
+                const upgrade = shuffled[i];
+                const card = this.cards[i];
+                card.upgrade = upgrade;
+                card.icon.setText(upgrade.icon);
+                card.name.setText(upgrade.name);
+                card.desc.setText(upgrade.desc);
+            }
+            
+            this.scene.physics.pause();
+        }
+        
+        select(index) {
+            if (this.selected) return;
+            this.selected = true;
+            
+            const card = this.cards[index];
+            if (card.upgrade) {
+                card.upgrade.apply(this.scene.gameScene.player);
+            }
+            
+            this.setVisible(false);
+            this.visible = false;
+            this.scene.physics.resume();
+        }
+        
+        update() {
+            // Nothing needed
+        }
+    }
+
+    // ============================================================
+    // GAME SCENE
+    // ============================================================
+    class GameScene extends Phaser.Scene {
+        constructor() {
+            super({ key: 'GameScene' });
+        }
+        
+        create() {
+            this.gameScene = this;
+            
+            // Camera
+            this.cameras.main.setBackgroundColor(0x0d0d1a);
+            this.cameras.main.zoom = 1;
+            
+            // Tilemap
+            this.tilemap = new IsoTilemap(this);
+            
+            // Input
+            this.inputManager = new InputManager(this);
+            
+            // Player
+            const spawn = this.tilemap.getValidSpawn();
+            this.player = new Player(this, spawn.mx, spawn.my);
+            
+            // Pools
+            this.enemyPool = new EntityPool(this, POOL_ENEMIES, () => new Enemy(this));
+            this.projectilePool = new EntityPool(this, POOL_PROJECTILES, () => new Projectile(this));
+            this.xpPool = new EntityPool(this, POOL_XP, () => new XPOrb(this));
+            this.particlePool = new EntityPool(this, POOL_PARTICLES, () => new Particle(this));
+            
+            // Systems
+            this.waveManager = new WaveManager(this);
+            this.spatialGrid = new SpatialGrid(4);
+            this.collisionGrid = new SpatialGrid(3);
+            
+            // Shooting
+            this.shootTimer = 0;
+            
+            // Upgrade UI
+            this.upgradeUI = new UpgradeUI(this);
+            this.upgradeUI.setVisible(false);
+            
+            // UI Graphics
+            this.uiGraphics = this.add.graphics();
+            this.uiGraphics.setDepth(10001);
+            
+            // Game Over
+            this.gameOver = false;
+            this.gameOverText = null;
+            
+            // Resize handler
+            this.scale.on('resize', this.resize, this);
+            
+            // FPS
+            this.fpsText = this.add.text(10, 10, '', { fontSize: '14px', color: '#666' }).setDepth(10002);
+        }
+        
+        resize(gameSize) {
+            this.cameras.main.setViewport(0, 0, gameSize.width, gameSize.height);
+            // Re-center tilemap would be needed here for full responsiveness
+        }
+        
+        update(time, delta) {
+            if (this.gameOver) {
+                if (this.inputManager.pointer.isDown && this.gameOverText) {
+                    this.scene.restart();
+                }
+                return;
+            }
+            
+            const dt = Math.min(delta, 50); // Cap delta
+            
+            // Update player
+            this.player.update(dt, this.inputManager, this.tilemap);
+            
+            // Camera follow
+            this.cameras.main.scrollX = this.player.x - this.cameras.main.width / 2;
+            this.cameras.main.scrollY = this.player.y - this.cameras.main.height / 2;
+            
+            // Wave manager
+            this.waveManager.update(dt, this.enemyPool, this.player, this.tilemap);
+            
+            // Update enemies
+            this.spatialGrid.clear();
+            this.enemyPool.updateAll(dt, time);
+            for (const enemy of this.enemyPool.active) {
+                enemy.update(dt, this.player, this.tilemap, time);
+                this.spatialGrid.insert(enemy);
+                
+                // Player collision
+                if (IsoMath.distance(enemy, this.player) < 0.6) {
+                    this.player.takeDamage(enemy.damage * dt * 0.001);
+                    // Push enemy back
+                    const pushAngle = IsoMath.angle(this.player, enemy);
+                    enemy.pushX += Math.cos(pushAngle) * 0.1;
+                    enemy.pushY += Math.sin(pushAngle) * 0.1;
+                }
+            }
+            
+            // Shooting
+            this.shootTimer -= dt;
+            if (this.shootTimer <= 0 && this.player.alive) {
+                this.shoot();
+                this.shootTimer = 600 * this.player.cooldownMult;
+            }
+            
+            // Update projectiles
+            this.projectilePool.updateAll(dt, time);
+            for (const proj of this.projectilePool.active) {
+                proj.update(dt, this.tilemap);
+                
+                // Check enemy hits
+                const nearby = this.spatialGrid.queryRange(proj.mx, proj.my, 1.5);
+                for (const enemy of nearby) {
+                    if (!proj.hitEnemies.has(enemy) && IsoMath.distance(proj, enemy) < 0.8) {
+                        proj.hitEnemies.add(enemy);
+                        const pushAngle = IsoMath.angle(proj, enemy);
+                        const died = enemy.takeDamage(proj.damage * this.player.damageMult, pushAngle, 0.15);
+                        
+                        if (died) {
+                            this.spawnXp(enemy.mx, enemy.my, enemy.xpValue);
+                            this.spawnParticles(enemy.x, enemy.y, COLORS.enemyTank, 8);
+                            this.player.kills++;
+                            if (this.player.lifesteal > 0) {
+                                this.player.heal(proj.damage * this.player.lifesteal);
+                            }
+                        }
+                        
+                        if (proj.pierce <= 0) {
+                            this.projectilePool.despawn(proj);
+                            break;
+                        } else {
+                            proj.pierce--;
+                        }
+                    }
+                }
+            }
+            
+            // Update XP orbs
+            for (const orb of this.xpPool.active) {
+                const result = orb.update(dt, this.player);
+                if (result === 'collected') {
+                    const leveled = this.player.addXp(orb.value);
+                    this.xpPool.despawn(orb);
+                    if (leveled) {
+                        this.upgradeUI.show(this.player);
+                    }
+                } else if (result === false) {
+                    this.xpPool.despawn(orb);
+                }
+            }
+            
+            // Update particles
+            this.particlePool.updateAll(dt, time);
+            
+            // Check game over
+            if (!this.player.alive && !this.gameOver) {
+                this.gameOver = true;
+                this.showGameOver();
+            }
+            
+            // Draw UI
+            this.drawUI();
+            
+            // FPS
+            this.fpsText.setText(Math.round(1000/dt) + ' FPS | Wave ' + this.waveManager.wave);
+            this.fpsText.setPosition(10, 10);
+        }
+        
+        shoot() {
+            if (this.enemyPool.active.length === 0) return;
+            
+            // Find nearest enemy
+            let nearest = null;
+            let minDist = Infinity;
+            for (const enemy of this.enemyPool.active) {
+                const dist = IsoMath.distance(this.player, enemy);
+                if (dist < minDist && dist < 12) {
+                    minDist = dist;
+                    nearest = enemy;
+                }
+            }
+            
+            if (!nearest) return;
+            
+            const angle = IsoMath.angle(this.player, nearest);
+            const count = this.player.projectileCount;
+            
+            for (let i = 0; i < count; i++) {
+                const spread = count > 1 ? (i - (count-1)/2) * 0.15 : 0;
+                const projAngle = angle + spread;
+                const speed = 7 * this.player.areaMult;
+                const damage = 12;
+                const pierce = count > 2 ? 1 : 0;
+                
+                this.projectilePool.spawn(this.player.mx, this.player.my, projAngle, damage, speed, pierce);
+            }
+        }
+        
+        spawnXp(mx, my, value) {
+            this.xpPool.spawn(mx + (Math.random()-0.5)*0.5, my + (Math.random()-0.5)*0.5, value);
+        }
+        
+        spawnParticles(x, y, color, count) {
+            for (let i = 0; i < count; i++) {
+                this.particlePool.spawn(x, y, color, 4 + Math.random() * 4, 0.3 + Math.random() * 0.5);
+            }
+        }
+        
+        drawUI() {
+            this.uiGraphics.clear();
+            
+            const w = this.cameras.main.width;
+            const h = this.cameras.main.height;
+            
+            // Health bar
+            const hpPct = this.player.hp / this.player.maxHp;
+            this.uiGraphics.fillStyle(COLORS.healthBg, 0.8);
+            this.uiGraphics.fillRoundedRect(20, h - 50, 200, 20, 4);
+            this.uiGraphics.fillStyle(hpPct > 0.3 ? COLORS.health : 0xef4444, 0.9);
+            this.uiGraphics.fillRoundedRect(20, h - 50, 200 * hpPct, 20, 4);
+            
+            // XP bar
+            const xpPct = this.player.xp / this.player.xpToLevel;
+            this.uiGraphics.fillStyle(COLORS.xpBarBg, 0.8);
+            this.uiGraphics.fillRoundedRect(20, h - 25, 200, 8, 2);
+            this.uiGraphics.fillStyle(COLORS.xpBar, 0.9);
+            this.uiGraphics.fillRoundedRect(20, h - 25, 200 * xpPct, 8, 2);
+            
+            // Level & Kills
+            this.uiGraphics.fillStyle(0x000000, 0.5);
+            this.uiGraphics.fillRoundedRect(20, 20, 120, 30, 4);
+            // (Text would need to be recreated each frame or use bitmap text - simplified here)
+            
+            // Timer
+            const mins = Math.floor(this.waveManager.time / 60);
+            const secs = Math.floor(this.waveManager.time % 60);
+            const timeStr = `${mins}:${secs.toString().padStart(2, '0')}`;
+            
+            // Joystick
+            this.inputManager.drawJoystick(this.uiGraphics);
+        }
+        
+        showGameOver() {
+            const w = this.cameras.main.width;
+            const h = this.cameras.main.height;
+            
+            const bg = this.add.rectangle(w/2, h/2, w, h, 0x000000, 0.8);
+            bg.setDepth(10000);
+            
+            const title = this.add.text(w/2, h/2 - 60, 'GAME OVER', {
+                fontSize: '48px',
+                fontStyle: 'bold',
+                color: '#ef4444'
+            }).setOrigin(0.5).setDepth(10001);
+            
+            const stats = this.add.text(w/2, h/2 + 10, 
+                `Level: ${this.player.level}\nKills: ${this.player.kills}\nZeit: ${Math.floor(this.waveManager.time)}s`, {
+                fontSize: '24px',
+                color: '#fff',
+                align: 'center'
+            }).setOrigin(0.5).setDepth(10001);
+            
+            const restart = this.add.text(w/2, h/2 + 80, 'Tippe zum Neustart', {
+                fontSize: '18px',
+                color: '#aaa'
+            }).setOrigin(0.5).setDepth(10001);
+            
+            this.gameOverText = { bg, title, stats, restart };
+        }
+    }
+
+    // ============================================================
+    // BOOT
+    // ============================================================
+    const config = {
+        type: Phaser.AUTO,
+        parent: 'game-container',
+        width: window.innerWidth,
+        height: window.innerHeight,
+        backgroundColor: '#0d0d1a',
+        scale: {
+            mode: Phaser.Scale.RESIZE,
+            autoCenter: Phaser.Scale.CENTER_BOTH
+        },
+        physics: {
+            default: 'arcade',
+            arcade: { debug: false, gravity: { y: 0 } }
+        },
+        scene: GameScene,
+        pixelArt: false,
+        antialias: true
+    };
+
+    new Phaser.Game(config);
+    </script>
+</body>
+</html>
